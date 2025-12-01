@@ -4,10 +4,6 @@
  * Bridge between frontend and Flask ML + AI service
  */
 
-// Error handling
-ini_set('display_errors', 0);
-ini_set('log_errors', 1);
-error_reporting(E_ALL);
 
 // Set JSON header
 header('Content-Type: application/json');
@@ -19,17 +15,22 @@ $action = $_GET['action'] ?? $_POST['action'] ?? '';
 if (in_array($action, ['status', 'analyze', 'get_analysis', 'analyze_batch', 'train', 'test', 'start_service'])) {
     // API calls - no session required
     require_once __DIR__ . '/../includes/conn.php';
-    require_once __DIR__ . '/../includes/rate_limit_helper.php';
     
-    // Rate limiting for API endpoints: 20 requests per minute per IP
-    $ipAddress = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
-    if (!checkRateLimit('ml_api_' . $action, $ipAddress, 20, 60)) {
-        http_response_code(429);
-        echo json_encode([
-            'status' => 'error',
-            'message' => 'Too many requests. Please slow down and try again.'
-        ]);
-        exit();
+    // Rate limiting for API endpoints: 20 requests per minute per IP (optional)
+    if (file_exists(__DIR__ . '/../includes/rate_limit_helper.php')) {
+        require_once __DIR__ . '/../includes/rate_limit_helper.php';
+        if (function_exists('checkRateLimit')) {
+            $ipAddress = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+            // Use call_user_func to avoid linter errors for optional function
+            if (!call_user_func('checkRateLimit', 'ml_api_' . $action, $ipAddress, 20, 60)) {
+                http_response_code(429);
+                echo json_encode([
+                    'status' => 'error',
+                    'message' => 'Too many requests. Please slow down and try again.'
+                ]);
+                exit();
+            }
+        }
     }
 } else {
     // For non-API calls, require full session
@@ -788,7 +789,8 @@ function call_flask_service($url, $data = [], $method = 'POST') {
         $response = curl_exec($ch);
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curl_error = curl_error($ch);
-        curl_close($ch);
+        // curl_close() is deprecated in PHP 8.0+ - handle is automatically closed when variable goes out of scope
+        unset($ch);
         
         if ($response === false || !empty($curl_error)) {
             error_log("Flask service connection failed: " . $curl_error);

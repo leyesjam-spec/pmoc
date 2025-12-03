@@ -148,10 +148,6 @@ class NLGRecommendationEngine:
         conflict_ratio = personalized_features.get('conflict_ratio', 0.0)
         male_avg = personalized_features.get('male_avg_response', 3.0)
         female_avg = personalized_features.get('female_avg_response', 3.0)
-        male_consistency = personalized_features.get('male_consistency', 0.5)
-        female_consistency = personalized_features.get('female_consistency', 0.5)
-        power_balance = personalized_features.get('power_balance', 0.0)
-        response_variance = personalized_features.get('response_variance', 0.0)
         
         # Calculate additional metrics
         male_agree_count = sum(1 for r in male_responses if r >= 4)
@@ -183,29 +179,16 @@ class NLGRecommendationEngine:
             template = random.choice(self.templates['conflict_low'])
             recommendations.append(template.format(conflict=int(conflict_ratio * 100)))
         
-        # 3. Generate power balance recommendations using actual data (only if there's actual imbalance)
-        # Only show power imbalance if there's significant difference AND low alignment
-        if (power_balance > 1.5 or power_balance < 0.3) and alignment_score < 0.8:
-            template = random.choice(self.templates['power_imbalance'])
-            recommendations.append(template.format(power_balance=power_balance))
-        elif power_balance >= 0.7 and power_balance <= 1.3:
-            template = random.choice(self.templates['power_balanced'])
-            recommendations.append(template.format(power_balance=power_balance))
-        
-        # 4. Generate consistency recommendations using actual data
-        if male_consistency < 0.4:
-            template = random.choice(self.templates['consistency_issues'])
-            recommendations.append(template.format(partner="the male partner's", consistency=int(male_consistency * 100)))
-        elif male_consistency > 0.7:
-            template = random.choice(self.templates['consistency_strong'])
-            recommendations.append(template.format(consistency=int(male_consistency * 100)))
-        
-        if female_consistency < 0.4:
-            template = random.choice(self.templates['consistency_issues'])
-            recommendations.append(template.format(partner="the female partner's", consistency=int(female_consistency * 100)))
-        elif female_consistency > 0.7:
-            template = random.choice(self.templates['consistency_strong'])
-            recommendations.append(template.format(consistency=int(female_consistency * 100)))
+        # 3. Generate partner difference recommendations based on average responses
+        avg_difference = abs(male_avg - female_avg)
+        if avg_difference > 0.5 and alignment_score < 0.8:
+            # Significant difference in partner responses
+            if male_avg > female_avg:
+                recommendations.append(f"Your responses show notable differences between partners (male: {male_avg:.1f}, female: {female_avg:.1f}). This suggests the need for balanced communication and decision-making processes.")
+            else:
+                recommendations.append(f"Your responses show notable differences between partners (male: {male_avg:.1f}, female: {female_avg:.1f}). This suggests the need for balanced communication and decision-making processes.")
+        elif avg_difference <= 0.3:
+            recommendations.append(f"Your responses demonstrate balanced partnership dynamics (male: {male_avg:.1f}, female: {female_avg:.1f}), indicating mutual respect and equal voice in the relationship.")
         
         # 5. Generate risk-based recommendations
         if risk_level == 'High':
@@ -225,7 +208,7 @@ class NLGRecommendationEngine:
         
         # 7. Generate personalized counseling approach
         recommendations.append(self._generate_counseling_approach_nlg(
-            risk_level, alignment_score, conflict_ratio, power_balance, couple_profile
+            risk_level, alignment_score, conflict_ratio, couple_profile
         ))
         
         return recommendations[:8]  # Limit to top 8 recommendations
@@ -268,8 +251,7 @@ class NLGRecommendationEngine:
         return f"Your responses indicate {int(score * 100)}% priority for {category['name']} development, suggesting this area would benefit from focused attention and counseling."
     
     def _generate_counseling_approach_nlg(self, risk_level: str, alignment_score: float, 
-                                        conflict_ratio: float, power_balance: float, 
-                                        couple_profile: Dict) -> str:
+                                        conflict_ratio: float, couple_profile: Dict) -> str:
         """Generate natural language counseling approach recommendation"""
         
         approaches = []
@@ -287,8 +269,6 @@ class NLGRecommendationEngine:
         if conflict_ratio > 0.3:
             approaches.append("conflict resolution and communication skills training")
         
-        if power_balance > 2.0 or power_balance < 0.5:
-            approaches.append("partnership balance and equality work")
         
         # Add demographic considerations
         age_gap = abs(couple_profile.get('male_age', 30) - couple_profile.get('female_age', 30))

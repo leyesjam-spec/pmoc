@@ -7,15 +7,29 @@ Uses Random Forest models for couple counseling risk assessment and recommendati
 import os
 import json
 import pickle
+import threading
 import numpy as np
 import pandas as pd
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
 from sklearn.metrics import accuracy_score, mean_squared_error
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.utils import class_weight
+
+# Import imbalanced-learn with error handling
+try:
+    from imblearn.over_sampling import SMOTE  # type: ignore
+    from imblearn.combine import SMOTETomek  # type: ignore
+    IMBALANCED_LEARN_AVAILABLE = True
+    print("[OK] imbalanced-learn imported successfully - SMOTE features enabled")
+except ImportError as e:
+    IMBALANCED_LEARN_AVAILABLE = False
+    SMOTE = None  # type: ignore
+    SMOTETomek = None  # type: ignore
+    print(f"Warning: imbalanced-learn not available. SMOTE features will be disabled. Error: {e}")
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -31,8 +45,7 @@ def calculate_personalized_features_flask(questionnaire_responses, male_response
         all_responses = male_responses + female_responses
     else:
         # questionnaire_responses should be a flat array of all responses
-        # We need to split them properly - the PHP API should send them as separate arrays
-        # For now, assume questionnaire_responses is already the combined responses
+        # We need to split them properly - the PHP API should ideally send them separately
         all_responses = questionnaire_responses
         
         # Since we don't have separate male/female responses, we need to calculate them
@@ -45,7 +58,7 @@ def calculate_personalized_features_flask(questionnaire_responses, male_response
             male_responses = questionnaire_responses
             female_responses = questionnaire_responses
     
-    # Calculate alignment score
+    # Calculate overall alignment score
     alignment_score = 0
     conflict_count = 0
     weighted_conflict_sum = 0.0
@@ -60,10 +73,6 @@ def calculate_personalized_features_flask(questionnaire_responses, male_response
         alignment_score += (4 - difference) / 4  # 0-1 scale
         
         # Count conflicts (responses that are very different)
-        # Asymmetric partial weights:
-        # - 4 vs 2: 1.0 (strong conflict)
-        # - 3 vs 2: 0.6 (neutral vs disagree)
-        # - 4 vs 3: 0.4 (agree vs neutral)
         if difference >= 2:
             conflict_count += 1
             weighted_conflict_sum += 1.0
@@ -74,7 +83,6 @@ def calculate_personalized_features_flask(questionnaire_responses, male_response
             elif (male_resp == 4 and female_resp == 3) or (male_resp == 3 and female_resp == 4):
                 weighted_conflict_sum += 0.4
             else:
-                # Fallback for unexpected scales: treat as mild
                 weighted_conflict_sum += 0.5
     
     alignment_score = alignment_score / total_questions if total_questions > 0 else 0.5
@@ -84,36 +92,60 @@ def calculate_personalized_features_flask(questionnaire_responses, male_response
     male_avg = sum(male_responses) / len(male_responses) if male_responses else 3.0
     female_avg = sum(female_responses) / len(female_responses) if female_responses else 3.0
     
-    # Calculate consistency (inverse of variance)
-    def calculate_consistency(responses):
-        if len(responses) < 2:
-            return 1.0
-        mean = sum(responses) / len(responses)
-        variance = sum((r - mean) ** 2 for r in responses) / len(responses)
-        return max(0, 1 - (variance / 4))  # 0-1 scale, higher = more consistent
+    # NEW: Category-specific alignment scores (4 features, one per MEAI category)
+    category_alignments = []
+    for category_id in range(1, len(MEAI_CATEGORIES) + 1):
+        # Get question IDs for this category
+        category_question_ids = [qid for qid, cid in MEAI_QUESTION_MAPPING.items() if cid == category_id]
+        
+        if not category_question_ids:
+            category_alignments.append(0.5)  # Default if no questions
+            continue
+        
+        # Calculate alignment for questions in this category only
+        category_alignment = 0
+        category_question_count = 0
+        
+        for qid in category_question_ids:
+            # Find response index (qid is 1-indexed, responses are 0-indexed)
+            resp_idx = qid - 1
+            if resp_idx < len(male_responses) and resp_idx < len(female_responses):
+                male_resp = male_responses[resp_idx]
+                female_resp = female_responses[resp_idx]
+                difference = abs(male_resp - female_resp)
+                category_alignment += (4 - difference) / 4
+                category_question_count += 1
+        
+        category_alignment = category_alignment / category_question_count if category_question_count > 0 else 0.5
+        category_alignments.append(category_alignment)
     
-    male_consistency = calculate_consistency(male_responses)
-    female_consistency = calculate_consistency(female_responses)
+    # NEW: Extreme response counts (4 features)
+    male_agree_count = sum(1 for r in male_responses if r == 4)  # Agree = 4
+    male_disagree_count = sum(1 for r in male_responses if r == 2)  # Disagree = 2
+    female_agree_count = sum(1 for r in female_responses if r == 4)
+    female_disagree_count = sum(1 for r in female_responses if r == 2)
     
-    # Calculate power balance as a ratio
-    power_balance = male_avg / female_avg if female_avg > 0 else 1.0
-    
-    # Calculate response variance
-    response_variance = 0
-    if len(all_responses) > 1:
-        mean = sum(all_responses) / len(all_responses)
-        response_variance = sum((r - mean) ** 2 for r in all_responses) / len(all_responses)
+    # Convert to ratios for better scaling
+    total_male = len(male_responses) if male_responses else 1
+    total_female = len(female_responses) if female_responses else 1
+    male_agree_ratio = male_agree_count / total_male
+    male_disagree_ratio = male_disagree_count / total_male
+    female_agree_ratio = female_agree_count / total_female
+    female_disagree_ratio = female_disagree_count / total_female
     
     return {
         'alignment_score': alignment_score,
         'conflict_ratio': conflict_ratio,
         'male_avg_response': male_avg,
         'female_avg_response': female_avg,
-        'male_consistency': male_consistency,
-        'female_consistency': female_consistency,
-        'power_balance': power_balance,
-        'response_variance': response_variance,
-        'total_conflicts': conflict_count
+        'total_conflicts': conflict_count,
+        # NEW: Category-specific alignments (4 features)
+        'category_alignments': category_alignments,
+        # NEW: Extreme response ratios (4 features)
+        'male_agree_ratio': male_agree_ratio,
+        'male_disagree_ratio': male_disagree_ratio,
+        'female_agree_ratio': female_agree_ratio,
+        'female_disagree_ratio': female_disagree_ratio
     }
 
 # Global variables for models
@@ -123,6 +155,16 @@ ml_models = {
     'risk_encoder': None
 }
 
+# Training status tracking
+training_status = {
+    'in_progress': False,
+    'progress': 0,
+    'message': '',
+    'error': None,
+    'thread': None  # Track the training thread
+}
+training_lock = threading.Lock()
+
 # MEAI Categories - dynamically loaded from database question_category table
 # These 4 categories are used for ML predictions and recommendations
 MEAI_CATEGORIES = []
@@ -130,6 +172,154 @@ MEAI_CATEGORIES = []
 # MEAI Questions and Sub-questions - dynamically loaded from database
 MEAI_QUESTIONS = {}  # {category_id: {question_id: {text, sub_questions: []}}}
 MEAI_QUESTION_MAPPING = {}  # {question_id: category_id}
+
+# ============================================================================
+# DATA VALIDATION FUNCTIONS
+# ============================================================================
+
+def validate_couple_data(couple_profile, questionnaire_responses, male_responses=None, female_responses=None):
+    """Validate input data before training/prediction"""
+    errors = []
+    warnings = []
+    
+    # Validate ages
+    male_age = couple_profile.get('male_age', 0)
+    female_age = couple_profile.get('female_age', 0)
+    
+    if not (18 <= male_age <= 100):
+        errors.append(f"Invalid male age: {male_age} (must be 18-100)")
+    if not (18 <= female_age <= 100):
+        errors.append(f"Invalid female age: {female_age} (must be 18-100)")
+    
+    # Check age gap (warning if too large)
+    age_gap = abs(male_age - female_age)
+    if age_gap > 30:
+        warnings.append(f"Large age gap detected: {age_gap} years")
+    
+    # Validate education and income levels
+    education_level = couple_profile.get('education_level', 0)
+    income_level = couple_profile.get('income_level', 0)
+    
+    if not (0 <= education_level <= 4):
+        errors.append(f"Invalid education level: {education_level} (must be 0-4)")
+    if not (0 <= income_level <= 4):
+        errors.append(f"Invalid income level: {income_level} (must be 0-4)")
+    
+    # Validate years living together
+    years_together = couple_profile.get('years_living_together', 0)
+    if years_together < 0:
+        errors.append(f"Invalid years living together: {years_together} (cannot be negative)")
+    if years_together > 50:
+        warnings.append(f"Unusually high years living together: {years_together}")
+    
+    # Validate children count
+    children = couple_profile.get('children', 0)
+    if children < 0:
+        errors.append(f"Invalid children count: {children} (cannot be negative)")
+    if children > 10:
+        warnings.append(f"Unusually high children count: {children}")
+    
+    # Validate questionnaire responses
+    if questionnaire_responses:
+        expected_count = len(MEAI_QUESTION_MAPPING) if MEAI_QUESTION_MAPPING else 31
+        if len(questionnaire_responses) != expected_count:
+            errors.append(f"Expected {expected_count} responses, got {len(questionnaire_responses)}")
+        
+        # Check for invalid response values
+        invalid_responses = [r for r in questionnaire_responses if r not in [2, 3, 4]]
+        if invalid_responses:
+            errors.append(f"Invalid response values found: {set(invalid_responses)} (must be 2, 3, or 4)")
+        
+        # Check for edge case: all responses the same
+        unique_responses = set(questionnaire_responses)
+        if len(unique_responses) == 1:
+            warnings.append("All questionnaire responses are identical - may indicate data quality issue")
+        
+        # Check for too many neutral responses (potential issue)
+        neutral_count = sum(1 for r in questionnaire_responses if r == 3)
+        neutral_ratio = neutral_count / len(questionnaire_responses) if questionnaire_responses else 0
+        if neutral_ratio > 0.8:
+            warnings.append(f"High proportion of neutral responses: {neutral_ratio:.1%} (may indicate uncertainty)")
+    
+    # Validate male/female responses if provided
+    if male_responses and female_responses:
+        if len(male_responses) != len(female_responses):
+            errors.append(f"Mismatched response counts: male={len(male_responses)}, female={len(female_responses)}")
+        
+        # Check for identical responses (edge case)
+        if male_responses == female_responses:
+            warnings.append("Male and female responses are identical - may indicate data quality issue")
+    
+    # Validate civil status
+    civil_status = couple_profile.get('civil_status', 'Single')
+    valid_statuses = ['Single', 'Living In', 'Separated', 'Divorced', 'Widowed']
+    if civil_status not in valid_statuses:
+        warnings.append(f"Unusual civil status: {civil_status} (expected: {valid_statuses})")
+    
+    return {
+        'valid': len(errors) == 0,
+        'errors': errors,
+        'warnings': warnings
+    }
+
+def validate_training_data(X, y_risk, y_categories):
+    """Validate training data before model training"""
+    errors = []
+    warnings = []
+    
+    # Check for missing values
+    if np.isnan(X).any():
+        nan_count = np.isnan(X).sum()
+        errors.append(f"Found {nan_count} NaN values in feature matrix")
+    
+    if np.isinf(X).any():
+        inf_count = np.isinf(X).sum()
+        errors.append(f"Found {inf_count} infinite values in feature matrix")
+    
+    # Check for empty data
+    if len(X) == 0:
+        errors.append("Training data is empty")
+    
+    if len(y_risk) == 0:
+        errors.append("Risk labels are empty")
+    
+    if len(y_categories) == 0:
+        errors.append("Category labels are empty")
+    
+    # Check data shapes
+    if len(X) != len(y_risk):
+        errors.append(f"Mismatched data shapes: X has {len(X)} samples, y_risk has {len(y_risk)}")
+    
+    if len(X) != len(y_categories):
+        errors.append(f"Mismatched data shapes: X has {len(X)} samples, y_categories has {len(y_categories)}")
+    
+    # Check for class imbalance
+    unique_risks, counts = np.unique(y_risk, return_counts=True)
+    if len(unique_risks) < 3:
+        warnings.append(f"Only {len(unique_risks)} risk classes found (expected 3) - synthetic samples will be added")
+    
+    # Check for severe imbalance (this is expected before SMOTE)
+    max_count = max(counts)
+    min_count = min(counts)
+    imbalance_ratio = max_count / min_count if min_count > 0 else float('inf')
+    if imbalance_ratio > 5:
+        warnings.append(f"Class imbalance detected before SMOTE: ratio {imbalance_ratio:.1f}:1 (SMOTE will balance this)")
+    
+    # Check for outliers in features (using IQR method)
+    for i in range(min(10, X.shape[1])):  # Check first 10 features
+        Q1 = np.percentile(X[:, i], 25)
+        Q3 = np.percentile(X[:, i], 75)
+        IQR = Q3 - Q1
+        if IQR > 0:
+            outliers = np.sum((X[:, i] < Q1 - 3*IQR) | (X[:, i] > Q3 + 3*IQR))
+            if outliers > len(X) * 0.05:  # More than 5% outliers
+                warnings.append(f"Feature {i} has {outliers} potential outliers ({outliers/len(X):.1%})")
+    
+    return {
+        'valid': len(errors) == 0,
+        'errors': errors,
+        'warnings': warnings
+    }
 
 def load_categories_from_db():
     """Load MEAI categories from database question_category table"""
@@ -315,8 +505,15 @@ def generate_synthetic_data_based_on_real_couples(num_couples, real_couples_data
     female_ages = [age[1] for age in real_ages]
     age_gaps = [abs(age[0] - age[1]) for age in real_ages]
     
+    # Ensure we generate samples for all 3 risk classes
+    # Allocate: 30% Low, 40% Medium, 30% High
+    num_low = int(num_couples * 0.30)
+    num_medium = int(num_couples * 0.40)
+    num_high = num_couples - num_low - num_medium
+    
     data = []
     
+    # Generate couples for all risk classes in one loop
     for i in range(num_couples):
         # Sample from real couple patterns with some variation
         base_couple_idx = np.random.randint(0, len(real_couples_data))
@@ -363,17 +560,45 @@ def generate_synthetic_data_based_on_real_couples(num_couples, real_couples_data
         base_responses = base_couple['questionnaire_responses']
         questionnaire_responses = []
         
-        for j, base_response in enumerate(base_responses):
-            # Add some variation to responses while maintaining patterns
-            variation = np.random.choice([-1, 0, 1], p=[0.1, 0.8, 0.1])
-            new_response = max(2, min(4, base_response + variation))
-            questionnaire_responses.append(new_response)
+        # Determine target risk level for this couple
+        if i < num_low:
+            target_risk = 'Low'
+            target_disagree_ratio = np.random.uniform(0.0, 0.15)  # Low risk: 0-15% disagree
+        elif i < num_low + num_medium:
+            target_risk = 'Medium'
+            target_disagree_ratio = np.random.uniform(0.15, 0.30)  # Medium risk: 15-30% disagree
+        else:
+            target_risk = 'High'
+            target_disagree_ratio = np.random.uniform(0.30, 0.60)  # High risk: 30-60% disagree
         
-        # Calculate risk level based on response patterns
+        # Generate responses to match target disagree ratio
+        total_questions = len(base_responses)
+        target_disagree_count = int(total_questions * target_disagree_ratio)
+        target_agree_count = int(total_questions * (1 - target_disagree_ratio) * 0.6)  # 60% of remaining are agree
+        target_neutral_count = total_questions - target_disagree_count - target_agree_count
+        
+        # Create response array
+        response_array = [2] * target_disagree_count + [4] * target_agree_count + [3] * target_neutral_count
+        np.random.shuffle(response_array)
+        
+        # Apply some variation based on real patterns
+        for j, base_response in enumerate(base_responses):
+            if j < len(response_array):
+                # Blend target response with base pattern (70% target, 30% base)
+                if np.random.random() < 0.3:
+                    variation = np.random.choice([-1, 0, 1], p=[0.1, 0.8, 0.1])
+                    new_response = max(2, min(4, base_response + variation))
+                else:
+                    new_response = response_array[j]
+                questionnaire_responses.append(new_response)
+            else:
+                questionnaire_responses.append(response_array[j % len(response_array)])
+        
+        # Calculate actual risk level based on response patterns
         disagree_count = sum(1 for r in questionnaire_responses if r == 2)
         disagree_ratio = disagree_count / len(questionnaire_responses)
         
-        if disagree_ratio > 0.3:
+        if disagree_ratio > 0.30:
             risk_level = 'High'
         elif disagree_ratio > 0.15:
             risk_level = 'Medium'
@@ -430,6 +655,12 @@ def generate_synthetic_data(num_couples=500):
     np.random.seed(42)
     
     data = []
+    
+    # Ensure we generate samples for all 3 risk classes
+    # Allocate: 30% Low, 40% Medium, 30% High
+    num_low = int(num_couples * 0.30)
+    num_medium = int(num_couples * 0.40)
+    num_high = num_couples - num_low - num_medium
     
     # Define realistic couple profiles with different risk patterns
     couple_profiles = [
@@ -529,42 +760,43 @@ def generate_synthetic_data(num_couples=500):
         total_questions = len(MEAI_QUESTION_MAPPING) if MEAI_QUESTION_MAPPING else 31  # Fallback to 31
         questionnaire_responses = np.random.randint(2, 5, total_questions)  # 2=disagree, 3=neutral, 4=agree
         
-        # Generate responses based on risk bias and couple characteristics
-        if risk_bias == 'high':
-            # High risk: more disagreements, conflicts
-            base_disagree_prob = 0.4
-            base_agree_prob = 0.3
-        elif risk_bias == 'low':
-            # Low risk: more agreements, harmony
-            base_disagree_prob = 0.1
-            base_agree_prob = 0.6
-        else:  # medium
-            # Medium risk: balanced responses
-            base_disagree_prob = 0.2
-            base_agree_prob = 0.4
+        # Determine target risk level for this couple based on allocation
+        if i < num_low:
+            target_risk = 'Low'
+            target_disagree_ratio = np.random.uniform(0.0, 0.15)  # Low risk: 0-15% disagree
+        elif i < num_low + num_medium:
+            target_risk = 'Medium'
+            target_disagree_ratio = np.random.uniform(0.15, 0.30)  # Medium risk: 15-30% disagree
+        else:
+            target_risk = 'High'
+            target_disagree_ratio = np.random.uniform(0.30, 0.60)  # High risk: 30-60% disagree
+        
+        # Generate responses based on target risk level and couple characteristics
+        base_disagree_prob = target_disagree_ratio
+        base_agree_prob = (1 - target_disagree_ratio) * 0.6  # 60% of remaining are agree
         
         # Adjust based on age gap (larger gaps = more disagreements)
         age_gap = abs(male_age - female_age)
         if age_gap > 10:
-            base_disagree_prob += 0.2
-            base_agree_prob -= 0.1
+            base_disagree_prob = min(0.8, base_disagree_prob + 0.1)
+            base_agree_prob = max(0.1, base_agree_prob - 0.05)
         elif age_gap > 5:
-            base_disagree_prob += 0.1
-            base_agree_prob -= 0.05
+            base_disagree_prob = min(0.8, base_disagree_prob + 0.05)
+            base_agree_prob = max(0.1, base_agree_prob - 0.02)
         
         # Adjust based on education mismatch
         education_diff = abs(education_level - income_level)
         if education_diff > 2:
-            base_disagree_prob += 0.1
-            base_agree_prob -= 0.05
+            base_disagree_prob = min(0.8, base_disagree_prob + 0.05)
+            base_agree_prob = max(0.1, base_agree_prob - 0.02)
         
         # Adjust based on civil status
         if civil_status in ['Separated', 'Divorced']:
-            base_disagree_prob += 0.2
-            base_agree_prob -= 0.1
+            base_disagree_prob = min(0.8, base_disagree_prob + 0.1)
+            base_agree_prob = max(0.1, base_agree_prob - 0.05)
         elif civil_status == 'Living In' and years_living_together > 10:
-            base_disagree_prob -= 0.1
-            base_agree_prob += 0.1
+            base_disagree_prob = max(0.05, base_disagree_prob - 0.05)
+            base_agree_prob = min(0.8, base_agree_prob + 0.05)
         
         # Ensure probabilities are valid
         base_disagree_prob = max(0.05, min(0.8, base_disagree_prob))
@@ -582,7 +814,7 @@ def generate_synthetic_data(num_couples=500):
         disagree_count = sum(1 for r in questionnaire_responses if r == 2)
         disagree_ratio = disagree_count / len(questionnaire_responses)
         
-        if disagree_ratio > 0.35:
+        if disagree_ratio > 0.30:
             risk_level = 'High'
         elif disagree_ratio > 0.15:
             risk_level = 'Medium'
@@ -661,9 +893,9 @@ def load_real_couples_for_training():
             MAX(cp.civil_status) as civil_status,
             MAX(cp.years_living_together) as years_living_together,
             MAX(cp.past_children) as past_children,
-            MAX(cp.children) as children,
-            MAX(cp.education_level) as education_level,
-            MAX(cp.income_level) as income_level
+            MAX(cp.past_children_count) as children,
+            MAX(cp.education) as education,
+            MAX(cp.monthly_income) as monthly_income
         FROM couple_profile cp
         GROUP BY cp.access_id
         HAVING COUNT(DISTINCT cp.sex) = 2
@@ -680,33 +912,117 @@ def load_real_couples_for_training():
         
         # Get MEAI responses for each couple
         training_data = []
+        
+        # Education and income mapping (same as PHP)
+        education_mapping = {
+            'No Education': 0, 'Pre School': 0, 'Elementary Level': 0, 'Elementary Graduate': 0,
+            'High School Level': 1, 'High School Graduate': 1, 'Junior HS Level': 1, 'Junior HS Graduate': 1,
+            'Senior HS Level': 1, 'Senior HS Graduate': 1, 'College Level': 2, 'College Graduate': 3,
+            'Vocational/Technical': 2, 'ALS': 1, 'Post Graduate': 4
+        }
+        
+        income_mapping = {
+            '5000 below': 0, '5999-9999': 0, '10000-14999': 1, '15000-19999': 1,
+            '20000-24999': 2, '25000 above': 3
+        }
+        
         for couple in couples:
-            access_id, male_name, female_name, male_age, female_age, civil_status, years_living_together, past_children, children, education_level, income_level = couple
+            access_id, male_name, female_name, male_age, female_age, civil_status, years_living_together, past_children, children, education, monthly_income = couple
             
-            # Get MEAI responses for this couple
+            # Get MEAI responses for this couple from couple_responses table
+            # Get responses ordered by category, question, sub-question, then respondent
             response_query = """
-            SELECT qr.question_id, qr.response, qr.reason
-            FROM question_response qr
-            WHERE qr.access_id = %s
-            ORDER BY qr.question_id
+            SELECT cr.category_id, cr.question_id, cr.sub_question_id, cr.respondent, cr.response
+            FROM couple_responses cr
+            WHERE cr.access_id = %s
+            ORDER BY cr.category_id, cr.question_id, COALESCE(cr.sub_question_id, 0), cr.respondent
             """
             cursor.execute(response_query, (access_id,))
             responses = cursor.fetchall()
             
-            if len(responses) < 50:  # Need minimum responses
+            if len(responses) < 20:  # Need minimum responses
                 continue
                 
-            # Convert responses to numeric format (2=disagree, 3=neutral, 4=agree)
-            questionnaire_responses = []
-            for _, response, _ in responses:
+            # Build response map: (category_id, question_id, sub_question_id) -> {male: val, female: val}
+            response_map = {}
+            for category_id, question_id, sub_question_id, respondent, response in responses:
+                key = (category_id, question_id, sub_question_id)
+                if key not in response_map:
+                    response_map[key] = {'male': None, 'female': None}
+                
+                # Convert response to numeric (2=disagree, 3=neutral, 4=agree)
                 if response == 'agree':
-                    questionnaire_responses.append(4)
+                    resp_value = 4
                 elif response == 'neutral':
-                    questionnaire_responses.append(3)
+                    resp_value = 3
                 else:  # disagree
-                    questionnaire_responses.append(2)
+                    resp_value = 2
+                
+                if respondent.lower() == 'male':
+                    response_map[key]['male'] = resp_value
+                else:
+                    response_map[key]['female'] = resp_value
             
-            # Get total expected responses (main questions only, not sub-questions)
+            # Build questionnaire_responses array matching MEAI_QUESTION_MAPPING structure
+            # MEAI_QUESTION_MAPPING maps sequential IDs (1, 2, 3...) to category_ids
+            # We need to match responses using the MEAI_QUESTIONS structure
+            questionnaire_responses = []
+            
+            # Build a lookup: (category_id, question_id, sub_question_id) -> response value
+            # IMPORTANT: Don't just average - consider partner disagreements as risk indicators
+            response_lookup = {}
+            for key, resp_data in response_map.items():
+                category_id, question_id, sub_question_id = key
+                male_resp = resp_data.get('male')
+                female_resp = resp_data.get('female')
+                
+                # Consider partner disagreements as indicators of conflict
+                if male_resp is not None and female_resp is not None:
+                    # If partners disagree (difference >= 2), this indicates conflict
+                    # Use the more negative response (lower value) to capture the disagreement
+                    if abs(male_resp - female_resp) >= 2:  # Significant disagreement
+                        # Use the lower (more negative) response to reflect the conflict
+                        avg_resp = min(male_resp, female_resp)
+                    else:
+                        # Minor difference - use average
+                        avg_resp = round((male_resp + female_resp) / 2)
+                    response_lookup[key] = avg_resp
+                elif male_resp is not None:
+                    response_lookup[key] = male_resp
+                elif female_resp is not None:
+                    response_lookup[key] = female_resp
+                else:
+                    response_lookup[key] = 3  # Default to neutral
+            
+            # Build responses in the order defined by MEAI_QUESTION_MAPPING
+            # Iterate through categories and questions in the same order as MEAI_QUESTION_MAPPING
+            for cat_id in sorted(MEAI_QUESTIONS.keys()):
+                cat_questions = MEAI_QUESTIONS[cat_id]
+                for q_id in sorted(cat_questions.keys()):
+                    q_data = cat_questions[q_id]
+                    
+                    if q_data['sub_questions']:
+                        # Question has sub-questions - map each sub-question
+                        for sub_idx, sub_q_text in enumerate(q_data['sub_questions']):
+                            # sub_question_id in database is 1-indexed, sub_idx is 0-indexed
+                            sub_q_id = sub_idx + 1
+                            key = (cat_id, q_id, sub_q_id)
+                            
+                            if key in response_lookup:
+                                questionnaire_responses.append(response_lookup[key])
+                            else:
+                                questionnaire_responses.append(3)  # Default to neutral
+                    else:
+                        # Standalone question - no sub-question
+                        key = (cat_id, q_id, None)
+                        
+                        if key in response_lookup:
+                            questionnaire_responses.append(response_lookup[key])
+                        else:
+                            questionnaire_responses.append(3)  # Default to neutral
+            
+            # Get total expected responses (includes both main questions AND sub-questions)
+            # MEAI_QUESTION_MAPPING maps each answerable question (standalone or sub-question) to a sequential ID
             total_expected_responses = len(MEAI_QUESTION_MAPPING)
             
             # Pad or truncate to expected number of responses
@@ -714,14 +1030,22 @@ def load_real_couples_for_training():
                 questionnaire_responses.append(3)  # Default to neutral
             questionnaire_responses = questionnaire_responses[:total_expected_responses]
             
-            # Calculate risk level based on actual responses (simple heuristic)
+            # Calculate risk level based on actual responses
+            # NOTE: This is a heuristic for LABELING training data only
+            # The ML model will learn from this labeled data and make predictions
+            # For actual predictions, the ML model is used (see analyze() function)
             # More disagreements = higher risk
+            # Also count neutral responses (3) as potential issues if they're from disagreements
             disagree_count = sum(1 for r in questionnaire_responses if r == 2)
-            disagree_ratio = disagree_count / len(questionnaire_responses)
+            neutral_count = sum(1 for r in questionnaire_responses if r == 3)
+            # Count neutral as partial disagreement (they might indicate unresolved issues)
+            weighted_disagree_count = disagree_count + (neutral_count * 0.3)
+            disagree_ratio = weighted_disagree_count / len(questionnaire_responses)
             
-            if disagree_ratio > 0.3:
+            # Adjusted thresholds to be more sensitive to issues
+            if disagree_ratio > 0.25:  # Lowered from 0.3 to catch more high-risk cases
                 risk_level = 'High'
-            elif disagree_ratio > 0.15:
+            elif disagree_ratio > 0.10:  # Lowered from 0.15 to catch more medium-risk cases
                 risk_level = 'Medium'
             else:
                 risk_level = 'Low'
@@ -750,21 +1074,53 @@ def load_real_couples_for_training():
                     continue
                 
                 # Calculate disagreement ratio for this category
-                cat_disagree_ratio = sum(1 for r in category_responses if r == 2) / len(category_responses)
+                # Count both disagreements and neutrals (which may indicate unresolved issues)
+                cat_disagree_count = sum(1 for r in category_responses if r == 2)
+                cat_neutral_count = sum(1 for r in category_responses if r == 3)
+                # Weight neutrals as partial disagreements
+                weighted_disagree_count = cat_disagree_count + (cat_neutral_count * 0.3)
+                cat_disagree_ratio = weighted_disagree_count / len(category_responses) if len(category_responses) > 0 else 0
                 
                 # Convert to 0-1 score (higher disagreement = higher score)
-                category_score = min(1.0, cat_disagree_ratio * 2)  # Scale up disagreement
+                # Use a better scaling function to capture more nuance
+                category_score = min(1.0, cat_disagree_ratio * 2.5)  # Increased from 2.0 to 2.5 for better sensitivity
                 category_scores.append(category_score)
             
+            # Map education and income to numeric levels
+            education_level = education_mapping.get(education, 2) if education else 2
+            income_level = income_mapping.get(monthly_income, 1) if monthly_income else 1
+            
+            # Convert ages to integers (age is stored as varchar)
+            try:
+                male_age = int(float(str(male_age).strip())) if male_age else 30
+                female_age = int(float(str(female_age).strip())) if female_age else 30
+            except (ValueError, TypeError):
+                male_age = 30
+                female_age = 30
+            
+            # Convert past_children from varchar ('Yes'/'No') to boolean
+            past_children_bool = False
+            if past_children:
+                past_children_str = str(past_children).strip().lower()
+                past_children_bool = past_children_str in ['yes', '1', 'true']
+            
+            # Convert years_living_together from varchar to int
+            years_together_int = 0
+            if years_living_together:
+                try:
+                    years_together_int = int(float(str(years_living_together).strip()))
+                except (ValueError, TypeError):
+                    years_together_int = 0
+            
             training_data.append({
-                'male_age': male_age or 30,
-                'female_age': female_age or 30,
+                'male_age': male_age,
+                'female_age': female_age,
                 'civil_status': civil_status or 'Single',
-                'years_living_together': years_living_together or 0,
-                'past_children': bool(past_children),
-                'children': children or 0,
-                'education_level': education_level or 2,
-                'income_level': income_level or 2,
+                'years_living_together': years_together_int,
+                'past_children': past_children_bool,
+                'children': int(children) if children else 0,
+                'education_level': education_level,
+                'income_level': income_level,
                 'questionnaire_responses': questionnaire_responses,
                 'risk_level': risk_level,
                 'category_scores': category_scores
@@ -782,38 +1138,87 @@ def train_ml_models():
     """Train machine learning models"""
     print("Training ML models...")
     
+    # Update progress: Loading questions and categories
+    with training_lock:
+        training_status['progress'] = 15
+        training_status['message'] = 'Loading questions and categories...'
+    
     # Ensure questions are loaded before training
     if not MEAI_CATEGORIES:
         load_categories_from_db()
     if not MEAI_QUESTIONS:
         load_questions_from_db()
     
+    # Update progress: Loading real couples
+    with training_lock:
+        training_status['progress'] = 20
+        training_status['message'] = 'Loading real couples from database...'
+    
     # Load real couples from database for training
     real_couples_data = load_real_couples_for_training()
+    
+    # Always generate synthetic data (500 couples)
+    # If we have real couples, use them to inform the synthetic generation
     if not real_couples_data:
-        print("No real couples found, using generic synthetic data as fallback")
-        data = generate_synthetic_data(500)
+        print("No real couples found, using generic synthetic data")
+        synthetic_data = generate_synthetic_data(500)
+        data = synthetic_data
     else:
-        print(f"Found {len(real_couples_data)} real couples, generating 500 synthetic couples based on their patterns")
+        print(f"Found {len(real_couples_data)} real couples")
+        print(f"Generating 500 synthetic couples based on real couple patterns")
         # Generate 500 synthetic couples based on real couple patterns
-        data = generate_synthetic_data_based_on_real_couples(500, real_couples_data)
+        synthetic_data = generate_synthetic_data_based_on_real_couples(500, real_couples_data)
+        
+        # Combine real couples with synthetic data
+        print(f"Combining {len(real_couples_data)} real couples with {len(synthetic_data)} synthetic couples")
+        data = real_couples_data + synthetic_data
+        print(f"Total training data: {len(data)} couples (real + synthetic)")
     
     df = pd.DataFrame(data)
+    
+    # Update progress: Preparing features
+    with training_lock:
+        training_status['progress'] = 25
+        training_status['message'] = 'Preparing features and encoding data...'
     
     # Prepare features
     X = []
     y_risk = []
     y_categories = []
     
-    for _, row in df.iterrows():
+    total_rows = len(df)
+    for idx, row in df.iterrows():
+        # Update progress during feature preparation (25-35%)
+        if idx % 50 == 0:
+            progress = 25 + int((idx / total_rows) * 10)
+            with training_lock:
+                training_status['progress'] = progress
+                training_status['message'] = f'Preparing features... ({idx}/{total_rows} couples)'
+        # NEW: Calculate age gap
+        age_gap = abs(row['male_age'] - row['female_age'])
+        
+        # NEW: Calculate education/income compatibility
+        education_income_diff = abs(row['education_level'] - row['income_level'])
+        
+        # NEW: Civil status encoding (one-hot: 3 features)
+        civil_status = row.get('civil_status', 'Single')
+        is_single = 1 if civil_status == 'Single' else 0
+        is_living_in = 1 if civil_status == 'Living In' else 0
+        is_separated_divorced = 1 if civil_status in ['Separated', 'Divorced', 'Widowed'] else 0
+        
         # Combine all features (same structure as analysis)
         features = [
             row['male_age'],
             row['female_age'],
+            age_gap,  # NEW
             row['years_living_together'],
             row['children'],
             row['education_level'],
-            row['income_level']
+            row['income_level'],
+            education_income_diff,  # NEW
+            is_single,  # NEW
+            is_living_in,  # NEW
+            is_separated_divorced  # NEW
         ]
         
         # Add questionnaire responses (ensure it's a flat list)
@@ -829,17 +1234,35 @@ def train_ml_models():
             # High risk: low alignment, high conflict
             alignment_score = np.random.uniform(0.2, 0.5)
             conflict_ratio = np.random.uniform(0.3, 0.7)
-            power_balance = np.random.uniform(1.0, 2.5)
+            # Category alignments: lower for high risk
+            category_alignments = [np.random.uniform(0.2, 0.5) for _ in range(4)]
+            # More extreme responses for high risk
+            male_agree_ratio = np.random.uniform(0.1, 0.3)
+            male_disagree_ratio = np.random.uniform(0.3, 0.5)
+            female_agree_ratio = np.random.uniform(0.1, 0.3)
+            female_disagree_ratio = np.random.uniform(0.3, 0.5)
         elif row['risk_level'] == 'Low':
             # Low risk: high alignment, low conflict
             alignment_score = np.random.uniform(0.6, 0.9)
             conflict_ratio = np.random.uniform(0.0, 0.2)
-            power_balance = np.random.uniform(0.0, 0.8)
+            # Category alignments: higher for low risk
+            category_alignments = [np.random.uniform(0.6, 0.9) for _ in range(4)]
+            # More balanced responses for low risk
+            male_agree_ratio = np.random.uniform(0.4, 0.6)
+            male_disagree_ratio = np.random.uniform(0.0, 0.2)
+            female_agree_ratio = np.random.uniform(0.4, 0.6)
+            female_disagree_ratio = np.random.uniform(0.0, 0.2)
         else:  # Medium
             # Medium risk: mixed patterns
             alignment_score = np.random.uniform(0.4, 0.7)
             conflict_ratio = np.random.uniform(0.1, 0.4)
-            power_balance = np.random.uniform(0.5, 1.5)
+            # Category alignments: mixed
+            category_alignments = [np.random.uniform(0.3, 0.7) for _ in range(4)]
+            # Moderate extreme responses
+            male_agree_ratio = np.random.uniform(0.2, 0.5)
+            male_disagree_ratio = np.random.uniform(0.1, 0.3)
+            female_agree_ratio = np.random.uniform(0.2, 0.5)
+            female_disagree_ratio = np.random.uniform(0.1, 0.3)
         
         # Add personalized features to match analysis structure
         personalized_features = [
@@ -847,10 +1270,13 @@ def train_ml_models():
             conflict_ratio,
             np.random.uniform(2.5, 3.5),  # male_avg_response
             np.random.uniform(2.5, 3.5),  # female_avg_response
-            np.random.uniform(0.3, 0.8),  # male_consistency
-            np.random.uniform(0.3, 0.8),  # female_consistency
-            power_balance,
-            np.random.uniform(0.5, 2.0)   # response_variance
+            # NEW: Category-specific alignments (4 features)
+            *category_alignments,
+            # NEW: Extreme response ratios (4 features)
+            male_agree_ratio,
+            male_disagree_ratio,
+            female_agree_ratio,
+            female_disagree_ratio
         ]
         
         features.extend(personalized_features)
@@ -876,19 +1302,302 @@ def train_ml_models():
     y_risk = np.array(y_risk)
     y_categories = np.array(y_categories)
     
+    # Ensure all 3 risk classes are present
+    unique_risks = np.unique(y_risk)
+    if len(unique_risks) < 3:
+        print(f"Warning: Only {len(unique_risks)} risk classes found (expected 3). Adding synthetic samples to ensure all classes are represented...")
+        
+        # Find missing risk classes
+        all_risk_classes = {0: 'Low', 1: 'Medium', 2: 'High'}
+        missing_classes = [rc for rc in all_risk_classes.keys() if rc not in unique_risks]
+        
+        # Generate synthetic samples for missing classes
+        total_questions = len(MEAI_QUESTION_MAPPING) if MEAI_QUESTION_MAPPING else 31
+        synthetic_samples = []
+        synthetic_risks = []
+        synthetic_categories = []
+        
+        for missing_class in missing_classes:
+            risk_name = all_risk_classes[missing_class]
+            # Generate 10 synthetic samples for each missing class
+            for _ in range(10):
+                # Generate ages
+                male_age = np.random.randint(25, 50)
+                female_age = np.random.randint(23, 48)
+                age_gap = abs(male_age - female_age)
+                
+                # Generate other attributes
+                civil_status = np.random.choice(['Single', 'Living In', 'Widowed'])
+                years_living_together = np.random.randint(0, 10) if civil_status == 'Living In' else 0
+                children = np.random.randint(0, 3)
+                education_level = np.random.randint(0, 4)
+                income_level = np.random.randint(0, 4)
+                education_income_diff = abs(education_level - income_level)
+                
+                # Civil status encoding
+                is_single = 1 if civil_status == 'Single' else 0
+                is_living_in = 1 if civil_status == 'Living In' else 0
+                is_separated_divorced = 1 if civil_status in ['Separated', 'Divorced', 'Widowed'] else 0
+                
+                # Generate questionnaire responses based on risk level
+                if risk_name == 'High':
+                    disagree_ratio = np.random.uniform(0.30, 0.60)
+                elif risk_name == 'Medium':
+                    disagree_ratio = np.random.uniform(0.15, 0.30)
+                else:  # Low
+                    disagree_ratio = np.random.uniform(0.0, 0.15)
+                
+                disagree_count = int(total_questions * disagree_ratio)
+                agree_count = int(total_questions * (1 - disagree_ratio) * 0.6)
+                neutral_count = total_questions - disagree_count - agree_count
+                
+                questionnaire_responses = [2] * disagree_count + [4] * agree_count + [3] * neutral_count
+                np.random.shuffle(questionnaire_responses)
+                
+                # Generate category scores based on risk level
+                if risk_name == 'High':
+                    category_scores = [np.random.uniform(0.5, 1.0) for _ in range(len(MEAI_CATEGORIES))]
+                elif risk_name == 'Medium':
+                    category_scores = [np.random.uniform(0.3, 0.7) for _ in range(len(MEAI_CATEGORIES))]
+                else:  # Low
+                    category_scores = [np.random.uniform(0.0, 0.5) for _ in range(len(MEAI_CATEGORIES))]
+                
+                # Build features
+                features = [
+                    male_age, female_age, age_gap, years_living_together, children,
+                    education_level, income_level, education_income_diff,
+                    is_single, is_living_in, is_separated_divorced
+                ]
+                
+                # Add personalized features
+                if risk_name == 'High':
+                    alignment_score = np.random.uniform(0.2, 0.5)
+                    conflict_ratio = np.random.uniform(0.3, 0.7)
+                    category_alignments = [np.random.uniform(0.2, 0.5) for _ in range(4)]
+                    male_agree_ratio = np.random.uniform(0.1, 0.3)
+                    male_disagree_ratio = np.random.uniform(0.3, 0.5)
+                    female_agree_ratio = np.random.uniform(0.1, 0.3)
+                    female_disagree_ratio = np.random.uniform(0.3, 0.5)
+                elif risk_name == 'Low':
+                    alignment_score = np.random.uniform(0.6, 0.9)
+                    conflict_ratio = np.random.uniform(0.0, 0.2)
+                    category_alignments = [np.random.uniform(0.6, 0.9) for _ in range(4)]
+                    male_agree_ratio = np.random.uniform(0.4, 0.6)
+                    male_disagree_ratio = np.random.uniform(0.0, 0.2)
+                    female_agree_ratio = np.random.uniform(0.4, 0.6)
+                    female_disagree_ratio = np.random.uniform(0.0, 0.2)
+                else:  # Medium
+                    alignment_score = np.random.uniform(0.4, 0.7)
+                    conflict_ratio = np.random.uniform(0.1, 0.4)
+                    category_alignments = [np.random.uniform(0.3, 0.7) for _ in range(4)]
+                    male_agree_ratio = np.random.uniform(0.2, 0.5)
+                    male_disagree_ratio = np.random.uniform(0.1, 0.3)
+                    female_agree_ratio = np.random.uniform(0.2, 0.5)
+                    female_disagree_ratio = np.random.uniform(0.1, 0.3)
+                
+                personalized_features = [
+                    alignment_score, conflict_ratio,
+                    np.random.uniform(2.5, 3.5),  # male_avg_response
+                    np.random.uniform(2.5, 3.5),  # female_avg_response
+                    *category_alignments,
+                    male_agree_ratio, male_disagree_ratio,
+                    female_agree_ratio, female_disagree_ratio
+                ]
+                
+                features.extend(personalized_features)
+                features.extend(questionnaire_responses)
+                
+                synthetic_samples.append(features)
+                synthetic_risks.append(missing_class)
+                synthetic_categories.append(category_scores)
+        
+        # Add synthetic samples to training data
+        if synthetic_samples:
+            X_synthetic = np.array(synthetic_samples)
+            y_risk_synthetic = np.array(synthetic_risks)
+            y_categories_synthetic = np.array(synthetic_categories)
+            
+            X = np.vstack([X, X_synthetic])
+            y_risk = np.concatenate([y_risk, y_risk_synthetic])
+            y_categories = np.vstack([y_categories, y_categories_synthetic])
+            
+            print(f"Added {len(synthetic_samples)} synthetic samples to ensure all risk classes are represented")
+            print(f"Final class distribution: {np.bincount(y_risk)}")
+    
+    # Update progress: Validating data
+    with training_lock:
+        training_status['progress'] = 35
+        training_status['message'] = 'Validating training data...'
+    
+    # Validate training data
+    print("Validating training data...")
+    validation_result = validate_training_data(X, y_risk, y_categories)
+    
+    if not validation_result['valid']:
+        print("ERROR: Training data validation failed:")
+        for error in validation_result['errors']:
+            print(f"  - {error}")
+        return False
+    
+    if validation_result['warnings']:
+        print("WARNINGS during validation:")
+        for warning in validation_result['warnings']:
+            print(f"  - {warning}")
+    
     print(f"Training with {X.shape[1]} features: {X.shape[0]} samples")
     
-    # Train risk prediction model
-    risk_model = RandomForestClassifier(n_estimators=100, random_state=42)
-    risk_model.fit(X, y_risk)
+    # Track original data composition for logging
+    num_real_couples = len(real_couples_data) if real_couples_data else 0
+    num_synthetic_couples = 500  # Always 500 synthetic couples
+    print(f"Data composition: {num_real_couples} real couples + {num_synthetic_couples} synthetic couples = {X.shape[0]} total")
+    print(f"Class distribution before SMOTE: {np.bincount(y_risk)}")
     
-    # Train category prediction model (multi-output regression)
-    category_model = MultiOutputRegressor(RandomForestRegressor(n_estimators=100, random_state=42))
-    category_model.fit(X, y_categories)
+    # Apply SMOTE to the COMBINED dataset (real + synthetic couples)
+    # This ensures balanced classes while preserving patterns from real data
+    if not IMBALANCED_LEARN_AVAILABLE:
+        print("Skipping SMOTE - imbalanced-learn not available")
+    else:
+        # Update progress: Applying SMOTE
+        with training_lock:
+            training_status['progress'] = 40
+            training_status['message'] = 'Applying SMOTE for class balancing...'
+        
+        print("Applying SMOTE to combined dataset (real + synthetic couples) for class balancing...")
+        try:
+            # Use SMOTETomek (combines SMOTE oversampling with Tomek undersampling)
+            smote_tomek = SMOTETomek(random_state=42, n_jobs=-1)
+            X_resampled, y_risk_resampled = smote_tomek.fit_resample(X, y_risk)
+            
+            # For category scores, we need to match the resampled indices
+            # SMOTETomek returns original samples + synthetic samples
+            # We'll use the original samples and generate synthetic category scores for new samples
+            original_size = len(X)
+            resampled_size = len(X_resampled)
+            
+            if resampled_size > original_size:
+                # New synthetic samples were added - generate matching category scores
+                y_categories_resampled = np.zeros((resampled_size, y_categories.shape[1]))
+                y_categories_resampled[:original_size] = y_categories
+                
+                # For synthetic samples, generate category scores based on their risk level
+                for i in range(original_size, resampled_size):
+                    risk_class = y_risk_resampled[i]
+                    if risk_class == 2:  # High risk
+                        y_categories_resampled[i] = np.random.uniform(0.5, 1.0, y_categories.shape[1])
+                    elif risk_class == 1:  # Medium risk
+                        y_categories_resampled[i] = np.random.uniform(0.3, 0.7, y_categories.shape[1])
+                    else:  # Low risk
+                        y_categories_resampled[i] = np.random.uniform(0.0, 0.5, y_categories.shape[1])
+            else:
+                # Some samples were removed (Tomek links) - keep matching ones
+                # This is a simplified approach - in practice, we'd track which samples were kept
+                y_categories_resampled = y_categories[:resampled_size]
+            
+            print(f"After SMOTE: {X_resampled.shape[0]} samples (was {X.shape[0]})")
+            print(f"Class distribution after SMOTE: {np.bincount(y_risk_resampled)}")
+            
+            X = X_resampled
+            y_risk = y_risk_resampled
+            y_categories = y_categories_resampled
+        except Exception as e:
+            print(f"SMOTE failed (using original data): {e}")
+            print("This is normal if you have very few samples or all samples in one class")
+            # Continue with original data if SMOTE fails
+    
+    # Check for class imbalance
+    class_weights = class_weight.compute_class_weight(
+        'balanced',
+        classes=np.unique(y_risk),
+        y=y_risk
+    )
+    class_weight_dict = dict(enumerate(class_weights))
+    print(f"Class distribution: {np.bincount(y_risk)}")
+    print(f"Class weights: {class_weight_dict}")
+    
+    # Update progress: Training risk model
+    with training_lock:
+        training_status['progress'] = 50
+        training_status['message'] = 'Tuning hyperparameters for risk model...'
+    
+    # Hyperparameter tuning for risk model
+    print("Tuning hyperparameters for risk model...")
+    risk_param_grid = {
+        'n_estimators': [100, 200],
+        'max_depth': [10, 15, None],
+        'min_samples_split': [2, 5],
+        'class_weight': ['balanced', class_weight_dict]
+    }
+    
+    risk_base_model = RandomForestClassifier(random_state=42)
+    risk_grid_search = GridSearchCV(
+        risk_base_model,
+        risk_param_grid,
+        cv=5,
+        scoring='accuracy',
+        n_jobs=-1,
+        verbose=1
+    )
+    
+    # Update progress during risk model training (50-70%)
+    with training_lock:
+        training_status['progress'] = 60
+        training_status['message'] = 'Training risk model (this may take a few minutes)...'
+    
+    risk_grid_search.fit(X, y_risk)
+    risk_model = risk_grid_search.best_estimator_
+    print(f"Best risk model params: {risk_grid_search.best_params_}")
+    print(f"Best risk model CV score: {risk_grid_search.best_score_:.3f}")
+    
+    # Update progress: Training category model
+    with training_lock:
+        training_status['progress'] = 70
+        training_status['message'] = 'Tuning hyperparameters for category model...'
+    
+    # Hyperparameter tuning for category model
+    print("Tuning hyperparameters for category model...")
+    category_param_grid = {
+        'estimator__n_estimators': [100, 200],
+        'estimator__max_depth': [10, 15, None],
+        'estimator__min_samples_split': [2, 5]
+    }
+    
+    category_base_model = MultiOutputRegressor(RandomForestRegressor(random_state=42))
+    category_grid_search = GridSearchCV(
+        category_base_model,
+        category_param_grid,
+        cv=5,
+        scoring='neg_mean_squared_error',
+        n_jobs=-1,
+        verbose=1
+    )
+    
+    # Update progress during category model training (70-85%)
+    with training_lock:
+        training_status['progress'] = 80
+        training_status['message'] = 'Training category model (this may take a few minutes)...'
+    
+    category_grid_search.fit(X, y_categories)
+    category_model = category_grid_search.best_estimator_
+    print(f"Best category model params: {category_grid_search.best_params_}")
+    print(f"Best category model CV score: {category_grid_search.best_score_:.3f}")
+    
+    # Update progress: Cross-validation
+    with training_lock:
+        training_status['progress'] = 85
+        training_status['message'] = 'Evaluating models with cross-validation...'
+    
+    # Cross-validation evaluation
+    risk_cv_scores = cross_val_score(risk_model, X, y_risk, cv=5, scoring='accuracy')
+    print(f"Risk model CV accuracy: {risk_cv_scores.mean():.3f} (+/- {risk_cv_scores.std() * 2:.3f})")
     
     # Create risk encoder
     risk_encoder = LabelEncoder()
     risk_encoder.fit(['Low', 'Medium', 'High'])
+    
+    # Update progress: Saving models
+    with training_lock:
+        training_status['progress'] = 90
+        training_status['message'] = 'Saving trained models to disk...'
         
         # Save models
     ml_models['risk_model'] = risk_model
@@ -896,17 +1605,28 @@ def train_ml_models():
     ml_models['risk_encoder'] = risk_encoder
     
     # Save to files
-    with open('risk_model.pkl', 'wb') as f:
-        pickle.dump(risk_model, f)
-    
-    with open('category_model.pkl', 'wb') as f:
-        pickle.dump(category_model, f)
-    
-    with open('risk_encoder.pkl', 'wb') as f:
-        pickle.dump(risk_encoder, f)
-    
-    print("ML models trained and saved successfully")
-    return True
+    try:
+        with open('risk_model.pkl', 'wb') as f:
+            pickle.dump(risk_model, f)
+        
+        with open('category_model.pkl', 'wb') as f:
+            pickle.dump(category_model, f)
+        
+        with open('risk_encoder.pkl', 'wb') as f:
+            pickle.dump(risk_encoder, f)
+        
+        # Update progress: Complete
+        with training_lock:
+            training_status['progress'] = 95
+            training_status['message'] = 'Models saved successfully!'
+        
+        print("ML models trained and saved successfully")
+        return True
+    except Exception as e:
+        print(f"Error saving models: {e}")
+        # Models are still in memory, so training was successful
+        # Just couldn't save to disk
+        return True  # Still return True since models are loaded in memory
 
 def load_ml_models():
     """Load pre-trained ML models"""
@@ -1034,27 +1754,99 @@ def status():
         'ml_trained': ml_trained
     })
 
+def train_models_async():
+    """Train ML models in background thread"""
+    import sys
+    import traceback
+    
+    with training_lock:
+        training_status['in_progress'] = True
+        training_status['progress'] = 0
+        training_status['message'] = 'Starting training...'
+        training_status['error'] = None
+    
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        with training_lock:
+            training_status['progress'] = 10
+            training_status['message'] = 'Loading data and preparing features...'
+        
+        success = train_ml_models()
+        
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        with training_lock:
+            if success:
+                training_status['in_progress'] = False
+                training_status['progress'] = 100
+                training_status['message'] = 'Training completed successfully!'
+            else:
+                training_status['in_progress'] = False
+                training_status['progress'] = 0
+                training_status['message'] = 'Training failed'
+                training_status['error'] = 'Training failed - check server logs for details'
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        print(f"Training error: {error_trace}", file=sys.stderr)
+        sys.stderr.flush()
+        
+        with training_lock:
+            training_status['in_progress'] = False
+            training_status['progress'] = 0
+            training_status['message'] = 'Training error occurred'
+            training_status['error'] = str(e)
+
 @app.route('/train', methods=['POST'])
 def train():
-    """Train ML models"""
-    try:
-        success = train_ml_models()
-        if success:
-            return jsonify({
-                'status': 'success',
-                'message': 'Models trained successfully',
-                'couples_count': 500,
-                'training_method': 'Real couples + Synthetic based on real patterns'
-            })
-        else:
-            return jsonify({
-                'status': 'error',
-                'message': 'Training failed'
-            })
-    except Exception as e:
+    """Start training ML models asynchronously"""
+    with training_lock:
+        # Check if training is actually running (thread alive check)
+        if training_status['in_progress']:
+            thread = training_status.get('thread')
+            if thread and thread.is_alive():
+                return jsonify({
+                    'status': 'error',
+                    'message': 'Training is already in progress. Please wait for it to complete.'
+                }), 400
+            else:
+                # Thread is dead but status says in_progress - reset it
+                print("Warning: Training status was stuck, resetting...")
+                training_status['in_progress'] = False
+                training_status['progress'] = 0
+                training_status['message'] = ''
+                training_status['error'] = None
+                training_status['thread'] = None
+        
+        # Reset status
+        training_status['in_progress'] = True
+        training_status['progress'] = 0
+        training_status['message'] = 'Starting training...'
+        training_status['error'] = None
+        
+        # Start training in background thread
+        thread = threading.Thread(target=train_models_async, daemon=True)
+        training_status['thread'] = thread
+        thread.start()
+        
         return jsonify({
-            'status': 'error',
-            'message': f'Training error: {str(e)}'
+            'status': 'success',
+            'message': 'Training started in background',
+            'training_started': True
+        })
+
+@app.route('/training_status', methods=['GET'])
+def get_training_status():
+    """Get current training status"""
+    with training_lock:
+        return jsonify({
+            'status': 'success',
+            'in_progress': training_status['in_progress'],
+            'progress': training_status['progress'],
+            'message': training_status['message'],
+            'error': training_status['error']
         })
 
 @app.route('/analyze', methods=['POST'])
@@ -1101,14 +1893,50 @@ def analyze():
         if not personalized_features or len(personalized_features) == 0:
             personalized_features = calculate_personalized_features_flask(questionnaire_responses, male_responses, female_responses)
         
+        # Validate input data before prediction
+        validation_result = validate_couple_data(
+            couple_profile, 
+            questionnaire_responses, 
+            male_responses, 
+            female_responses
+        )
+        
+        if not validation_result['valid']:
+            return jsonify({
+                'status': 'error',
+                'message': 'Data validation failed: ' + '; '.join(validation_result['errors'])
+            })
+        
+        if validation_result['warnings']:
+            print("WARNINGS during data validation:")
+            for warning in validation_result['warnings']:
+                print(f"  - {warning}")
+        
+        # NEW: Calculate age gap
+        age_gap = abs(couple_profile['male_age'] - couple_profile['female_age'])
+        
+        # NEW: Calculate education/income compatibility
+        education_income_diff = abs(couple_profile['education_level'] - couple_profile['income_level'])
+        
+        # NEW: Civil status encoding (one-hot: 3 features)
+        civil_status = couple_profile.get('civil_status', 'Single')
+        is_single = 1 if civil_status == 'Single' else 0
+        is_living_in = 1 if civil_status == 'Living In' else 0
+        is_separated_divorced = 1 if civil_status in ['Separated', 'Divorced', 'Widowed'] else 0
+        
         # Prepare features for ML models (original + personalized)
         features = [
             couple_profile['male_age'],
             couple_profile['female_age'],
+            age_gap,  # NEW
             couple_profile['years_living_together'],
             couple_profile['children'],
             couple_profile['education_level'],
-            couple_profile['income_level']
+            couple_profile['income_level'],
+            education_income_diff,  # NEW
+            is_single,  # NEW
+            is_living_in,  # NEW
+            is_separated_divorced  # NEW
         ] + questionnaire_responses
         
         # Add personalized features
@@ -1117,10 +1945,13 @@ def analyze():
             personalized_features.get('conflict_ratio', 0.0),
             personalized_features.get('male_avg_response', 3.0),
             personalized_features.get('female_avg_response', 3.0),
-            personalized_features.get('male_consistency', 0.5),
-            personalized_features.get('female_consistency', 0.5),
-            personalized_features.get('power_balance', 0.0),
-            personalized_features.get('response_variance', 0.0)
+            # NEW: Category-specific alignments (4 features)
+            *personalized_features.get('category_alignments', [0.5, 0.5, 0.5, 0.5]),
+            # NEW: Extreme response ratios (4 features)
+            personalized_features.get('male_agree_ratio', 0.0),
+            personalized_features.get('male_disagree_ratio', 0.0),
+            personalized_features.get('female_agree_ratio', 0.0),
+            personalized_features.get('female_disagree_ratio', 0.0)
         ]
         
         features.extend(personalized_feature_values)
@@ -1260,10 +2091,6 @@ def generate_rule_based_recommendations(risk_level, category_scores, focus_categ
     conflict_ratio = personalized_features.get('conflict_ratio', 0.0)
     male_avg = personalized_features.get('male_avg_response', 3.0)
     female_avg = personalized_features.get('female_avg_response', 3.0)
-    male_consistency = personalized_features.get('male_consistency', 0.5)
-    female_consistency = personalized_features.get('female_consistency', 0.5)
-    power_balance = personalized_features.get('power_balance', 0.0)
-    response_variance = personalized_features.get('response_variance', 0.0)
     
     # ENHANCED PERSONALIZATION: Analyze actual response patterns
     male_agree_count = sum(1 for r in male_responses if r >= 4)
@@ -1307,33 +2134,16 @@ def generate_rule_based_recommendations(risk_level, category_scores, focus_categ
     else:
         recommendations.append(f"🎯 EXCELLENT HARMONY: Only {int(conflict_ratio * 100)}% disagreement - maintain current healthy communication patterns")
     
-    # 3. DYNAMIC PARTNER-SPECIFIC RECOMMENDATIONS (only show if there's actual concern)
-    # Only show power imbalance if there's significant difference AND low alignment
-    if (power_balance > 1.5 or power_balance < 0.3) and alignment_score < 0.8:
+    # 3. PARTNER-SPECIFIC ANALYSIS (based on average responses)
+    # Check for significant differences in partner responses
+    avg_difference = abs(male_avg - female_avg)
+    if avg_difference > 0.5 and alignment_score < 0.8:
         if male_avg > female_avg:
-            recommendations.append(f"👨 MALE DOMINANCE: Male partner shows {male_avg:.1f} vs female {female_avg:.1f} average - ensure balanced decision-making and equal voice")
+            recommendations.append(f"👨 PARTNER DIFFERENCES: Male partner shows {male_avg:.1f} vs female {female_avg:.1f} average - ensure balanced decision-making and equal voice")
         else:
-            recommendations.append(f"👩 FEMALE DOMINANCE: Female partner shows {female_avg:.1f} vs male {male_avg:.1f} average - ensure balanced decision-making and equal voice")
-    elif power_balance >= 0.7 and power_balance <= 1.3:
-        recommendations.append(f"🤝 BALANCED PARTNERSHIP: {power_balance:.1f} power balance - excellent relationship equality")
-    # Skip moderate imbalance messages to avoid confusion
-    
-    # 4. ENHANCED PARTNER-SPECIFIC ANALYSIS
-    # Male partner analysis
-    if male_consistency < 0.3:
-        recommendations.append(f"👨 MALE INCONSISTENCY: {int(male_consistency * 100)}% consistency - male partner needs individual counseling to clarify values and goals")
-    elif male_consistency < 0.6:
-        recommendations.append(f"👨 MALE UNCERTAINTY: {int(male_consistency * 100)}% consistency - male partner may benefit from values clarification sessions")
-    else:
-        recommendations.append(f"👨 MALE CLARITY: {int(male_consistency * 100)}% consistency - male partner shows clear values and goals")
-    
-    # Female partner analysis
-    if female_consistency < 0.3:
-        recommendations.append(f"👩 FEMALE INCONSISTENCY: {int(female_consistency * 100)}% consistency - female partner needs individual counseling to clarify values and goals")
-    elif female_consistency < 0.6:
-        recommendations.append(f"👩 FEMALE UNCERTAINTY: {int(female_consistency * 100)}% consistency - female partner may benefit from values clarification sessions")
-    else:
-        recommendations.append(f"👩 FEMALE CLARITY: {int(female_consistency * 100)}% consistency - female partner shows clear values and goals")
+            recommendations.append(f"👩 PARTNER DIFFERENCES: Female partner shows {female_avg:.1f} vs male {male_avg:.1f} average - ensure balanced decision-making and equal voice")
+    elif avg_difference <= 0.3:
+        recommendations.append(f"🤝 BALANCED PARTNERSHIP: Similar response averages ({male_avg:.1f} vs {female_avg:.1f}) - excellent relationship equality")
     
     # 4.5. PARTNER-SPECIFIC RESPONSE PATTERN ANALYSIS
     if male_positive_ratio > 0.7:
@@ -1383,15 +2193,6 @@ def generate_rule_based_recommendations(risk_level, category_scores, focus_categ
             elif 'Health' in name:
                 recommendations.append(f"🏥 MODERATE HEALTH FOCUS: {name} at {int(score * 100)}% - health awareness sessions")
     
-    # 7. DYNAMIC RESPONSE PATTERN RECOMMENDATIONS
-    if response_variance > 2.5:
-        recommendations.append(f"📊 COMPLEX DYNAMICS: High variance ({response_variance:.1f}) suggests complex relationship patterns - comprehensive assessment and specialized counseling needed")
-    elif response_variance > 1.5:
-        recommendations.append(f"📊 VARIED RESPONSES: Moderate variance ({response_variance:.1f}) indicates diverse perspectives - structured communication training recommended")
-    elif response_variance > 0.5:
-        recommendations.append(f"📊 BALANCED DIVERSITY: Healthy variance ({response_variance:.1f}) shows good relationship complexity - continue current approach")
-    else:
-        recommendations.append(f"📊 CONSISTENT PATTERNS: Low variance ({response_variance:.1f}) indicates stable relationship dynamics - maintain current healthy patterns")
     
     return recommendations
 

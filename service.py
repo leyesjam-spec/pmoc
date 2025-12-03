@@ -36,6 +36,16 @@ warnings.filterwarnings('ignore')
 app = Flask(__name__)
 CORS(app)
 
+def get_db_config():
+    """Get database configuration from environment variables with fallbacks"""
+    return {
+        'host': os.environ.get('DB_HOST', 'localhost'),
+        'user': os.environ.get('DB_USER', 'root'),
+        'password': os.environ.get('DB_PASSWORD', ''),
+        'database': os.environ.get('DB_NAME', 'u520834156_DBpmoc25'),
+        'charset': 'utf8mb4'
+    }
+
 def calculate_personalized_features_flask(questionnaire_responses, male_responses, female_responses):
     """Calculate personalized features in Flask service when not provided by PHP API"""
     
@@ -327,14 +337,9 @@ def load_categories_from_db():
     try:
         import pymysql
         
-        # Database connection (same as PHP)
-        conn = pymysql.connect(
-            host='localhost',
-            user='root',
-            password='',
-            database='u520834156_DBpmoc25',
-            charset='utf8mb4'
-        )
+        # Database connection - uses environment variables for Heroku compatibility
+        db_config = get_db_config()
+        conn = pymysql.connect(**db_config)
         
         cursor = conn.cursor()
         cursor.execute("SELECT category_name FROM question_category ORDER BY category_id ASC")
@@ -378,14 +383,9 @@ def load_questions_from_db():
     try:
         import pymysql
         
-        # Database connection
-        conn = pymysql.connect(
-            host='localhost',
-            user='root',
-            password='',
-            database='u520834156_DBpmoc25',
-            charset='utf8mb4'
-        )
+        # Database connection - uses environment variables for Heroku compatibility
+        db_config = get_db_config()
+        conn = pymysql.connect(**db_config)
         
         cursor = conn.cursor()
         
@@ -871,14 +871,9 @@ def load_real_couples_for_training():
     try:
         import pymysql
         
-        # Database connection
-        conn = pymysql.connect(
-            host='localhost',
-            user='root',
-            password='',
-            database='u520834156_DBpmoc25',
-            charset='utf8mb4'
-        )
+        # Database connection - uses environment variables for Heroku compatibility
+        db_config = get_db_config()
+        conn = pymysql.connect(**db_config)
         
         cursor = conn.cursor()
         

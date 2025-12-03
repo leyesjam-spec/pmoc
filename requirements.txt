@@ -16,5 +16,8 @@ pymysql==1.1.0
 # Imbalanced learning for SMOTE
 imbalanced-learn==0.11.0
 
+# Production server
+gunicorn==21.2.0
+
 # Development and testing
 pytest==7.4.0

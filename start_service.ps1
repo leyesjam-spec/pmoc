@@ -44,7 +44,8 @@ if ($LASTEXITCODE -ne 0) {
 # Start the service
 Write-Host ""
 Write-Host "Starting ML Service..." -ForegroundColor Green
-Write-Host "Service URL: http://127.0.0.1:5000" -ForegroundColor Cyan
+Write-Host "Service URL: http://127.0.0.1:5000 (Local Development)" -ForegroundColor Cyan
+Write-Host "Production URL: https://endpoint-pmoc-a0a6708d039f.herokuapp.com" -ForegroundColor Cyan
 Write-Host "MEAI Categories: 4 (Marriage, Parenthood, Family Planning, Health)" -ForegroundColor Cyan
 Write-Host "Press Ctrl+C to stop the service" -ForegroundColor Yellow
 Write-Host "======================================================" -ForegroundColor Green

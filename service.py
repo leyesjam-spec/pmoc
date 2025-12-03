@@ -2314,4 +2314,8 @@ if __name__ == '__main__':
     print("Counseling Topics Models: Available" if all(model is not None for model in ml_models.values()) else "Counseling Topics Models: Training needed")
     print(f"Analysis Method: Random Forest Counseling Topics with {len(MEAI_CATEGORIES)} MEAI categories")
     
-    app.run(host='127.0.0.1', port=5000, debug=True)
+    # Heroku compatibility: use PORT environment variable if available
+    port = int(os.environ.get('PORT', 5000))
+    host = '0.0.0.0' if os.environ.get('PORT') else '127.0.0.1'
+    debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
+    app.run(host=host, port=port, debug=debug)
